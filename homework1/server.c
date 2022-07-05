@@ -8,6 +8,8 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <netdb.h>
+#include <sys/select.h>
+#include <stdbool.h>
 
 #define ERR_EXIT(a) do { perror(a); exit(1); } while(0)
 
@@ -53,7 +55,7 @@ typedef struct {
 int handle_read(request* reqP) {
     int r;
     char buf[512];
-
+    
     // Read in request from client
     r = read(reqP->conn_fd, buf, sizeof(buf));
     if (r < 0) return -1;
@@ -95,20 +97,64 @@ int main(int argc, char** argv) {
     // Loop for handling connections
     fprintf(stderr, "\nstarting on %.80s, port %d, fd %d, maxconn %d...\n", svr.hostname, svr.port, svr.listen_fd, maxfd);
 
+    //open registerRecord
+    file_fd = open("registerRecord",O_RDWR);
+    if(file_fd < 0){
+        fprintf(stderr,"no file names registerRecord");};
+    //
+
+    //set read lock and write lock in the same process
+    bool readLock[21] ={false}, writeLock[21]={false};
+
+    //
+    struct timeval timeout;
+    fd_set original_set, working_set;
+    
+    FD_ZERO(&original_set);
+    FD_SET(svr.listen_fd,&original_set);
+
+    struct flock lock;
+    int w;
     while (1) {
         // TODO: Add IO multiplexing
         
+        timeout.tv_sec=0;
+        timeout.tv_usec = 1000;
+        memcpy(&working_set,&original_set,sizeof(original_set));
         // Check new connection
-        clilen = sizeof(cliaddr);
-        conn_fd = accept(svr.listen_fd, (struct sockaddr*)&cliaddr, (socklen_t*)&clilen);
-        if (conn_fd < 0) {
+        if(select(maxfd,&working_set,NULL,NULL,&timeout)<=0){
+            continue;}
+        if(FD_ISSET(svr.listen_fd,&working_set)){
+            clilen = sizeof(cliaddr);
+            //file descriptor which talk with client
+            conn_fd = accept(svr.listen_fd, (struct sockaddr*)&cliaddr, (socklen_t*)&clilen);
+            w = write(conn_fd,"Please enter your id (to check your preference order):\n",56);
+            if(w<=0)
+                ERR_EXIT("something wrong when writting");
+            if (conn_fd < 0) {
             if (errno == EINTR || errno == EAGAIN) continue;  // try again
             if (errno == ENFILE) {
                 (void) fprintf(stderr, "out of file descriptor table ... (maxconn %d)\n", maxfd);
                 continue;
             }
             ERR_EXIT("accept");
+            }
+            FD_SET(conn_fd,&original_set);
+            continue;;
         }
+        else {
+            conn_fd = -1;
+            for(int i = 0; i < maxfd; i++) {
+                if(i != svr.listen_fd && FD_ISSET(i, &working_set)){
+                    conn_fd = i;
+                    FD_CLR(conn_fd,&original_set);
+                    break;
+                }
+            }
+            if(conn_fd==-1)
+                continue;
+        }
+
         requestP[conn_fd].conn_fd = conn_fd;
         strcpy(requestP[conn_fd].host, inet_ntoa(cliaddr.sin_addr));
         fprintf(stderr, "getting a new request... fd %d from %s\n", conn_fd, requestP[conn_fd].host);
@@ -119,18 +165,139 @@ int main(int argc, char** argv) {
             fprintf(stderr, "bad request from %s\n", requestP[conn_fd].host);
             continue;
         }
-
     // TODO: handle requests from clients
 #ifdef READ_SERVER      
+        //set lock 
+        registerRecord Record;
+        Record.id = atoi(requestP[conn_fd].buf);
+        lock.l_type = F_RDLCK;
+        lock.l_start = sizeof(registerRecord)*(Record.id-902001);
+        lock.l_whence = SEEK_SET;
+        lock.l_len = sizeof(registerRecord);
+        if(!writeLock[requestP[conn_fd].id-902001]&& fcntl(file_fd,F_SETLK,&lock)!= -1){
+            //no write lock so we could set read lock and read
+            readLock[requestP[conn_fd].id-902001] = true;
+            lseek(file_fd,sizeof(registerRecord)*(Record.id-902001),SEEK_SET);
+            read(file_fd,&Record,sizeof(Record));
+            fprintf(stderr,"id:%d Moderna:%d BNT:%d AZ:%d\n",Record.id,Record.Moderna,Record.BNT,Record.AZ);
+            char rank[3][16];
+            for(int i = 1 ; i < 4 ; i++){
+                if(Record.Moderna == i)
+                    strcpy(rank[i-1],"Moderna");
+                else if (Record.BNT==i)
+                    strcpy(rank[i-1],"BNT");
+                else
+                    strcpy(rank[i-1],"AZ");
+            }
+            sprintf(requestP[conn_fd].buf,"Your preference order is %s > %s > %s.\n",rank[0],rank[1],rank[2]);
+            write(requestP[conn_fd].conn_fd,requestP[conn_fd].buf,strlen(requestP[conn_fd].buf));
+
+            //unset lock
+            lock.l_type= F_UNLCK;
+            lock.l_start=sizeof(registerRecord)*(Record.id-902001);
+            lock.l_whence = SEEK_SET;
+            lock.l_len = sizeof(registerRecord);
+            fcntl(file_fd,F_SETLK, &lock);
+            readLock[requestP[conn_fd].id-902001] = false;
+            fprintf(stderr,"finish");
+        }
+        else{
+            sprintf(requestP[conn_fd].buf,"Locked.\n");
+            write(requestP[conn_fd].conn_fd,requestP[conn_fd].buf,strlen(requestP[conn_fd].buf));
+            close(requestP[conn_fd].conn_fd);
+            free_request(&requestP[conn_fd]);
+        }
+        /***
         fprintf(stderr, "%s", requestP[conn_fd].buf);
         sprintf(buf,"%s : %s",accept_read_header,requestP[conn_fd].buf);
-        write(requestP[conn_fd].conn_fd, buf, strlen(buf));    
+        write(requestP[conn_fd].conn_fd, buf, strlen(buf));   
+        ***/ 
 #elif defined WRITE_SERVER
-        fprintf(stderr, "%s", requestP[conn_fd].buf);
-        sprintf(buf,"%s : %s",accept_write_header,requestP[conn_fd].buf);
-        write(requestP[conn_fd].conn_fd, buf, strlen(buf));    
-#endif
+        if(requestP[conn_fd].wait_for_write == 0){
+            registerRecord Record;
+            Record.id = atoi(requestP[conn_fd].buf);
+            requestP[conn_fd].id = Record.id;
+            lock.l_type = F_WRLCK;
+            lock.l_start = sizeof(registerRecord)*(Record.id-902001);
+            lock.l_whence = SEEK_SET;
+            lock.l_len = sizeof(registerRecord);
+            if(!writeLock[requestP[conn_fd].id-902001]&& fcntl(file_fd,F_SETLK,&lock)!= -1){
+                //no write lock so we could set read lock and read
+                readLock[requestP[conn_fd].id-902001] = true;
+                lseek(file_fd,sizeof(registerRecord)*(Record.id-902001),SEEK_SET);
+                read(file_fd,&Record,sizeof(Record));
+                fprintf(stderr,"id:%d Moderna:%d BNT:%d AZ:%d\n",Record.id,Record.Moderna,Record.BNT,Record.AZ);
+                char rank[3][16];
+                for(int i = 1 ; i < 4 ; i++){
+                    if(Record.Moderna == i)
+                        strcpy(rank[i-1],"Moderna");
+                    else if (Record.BNT==i)
+                        strcpy(rank[i-1],"BNT");
+                    else
+                        strcpy(rank[i-1],"AZ");
+                }
+                sprintf(requestP[conn_fd].buf,"Your preference order is %s > %s > %s.\nPlease input your preference order respectively(AZ,BNT,Moderna):\n",rank[0],rank[1],rank[2]);
+                write(requestP[conn_fd].conn_fd,requestP[conn_fd].buf,strlen(requestP[conn_fd].buf));
+                //unset lock
+                
+                readLock[requestP[conn_fd].id-902001] = false;
+                fprintf(stderr,"finish");
+                requestP[conn_fd].wait_for_write = 1;
+                FD_SET(conn_fd,&original_set);
+                writeLock[requestP[conn_fd].id-902001] = true;
+            }
+            else{
+                sprintf(requestP[conn_fd].buf,"Locked.\n");
+                write(requestP[conn_fd].conn_fd,requestP[conn_fd].buf,strlen(requestP[conn_fd].buf));
+                close(requestP[conn_fd].conn_fd);
+                free_request(&requestP[conn_fd]);
+            }
+            continue;;
+        }
+        else{
+            registerRecord Record;
+            Record.id = requestP[conn_fd].id;
+            
+            
+            if(1){
+                lseek(file_fd,sizeof(registerRecord)*(Record.id-902001),SEEK_SET);
+                char *d = " ";
+                char *p = strtok(requestP[conn_fd].buf,d);
 
+
+                Record.AZ = atoi(p);
+                p = strtok(NULL, d);
+                Record.BNT = atoi(p);
+                p = strtok(NULL,d);
+                Record.Moderna=atoi(p);
+                char rank[3][16];
+                strcpy(rank[Record.AZ-1],"AZ");
+                strcpy(rank[Record.BNT-1] , "BNT");
+                strcpy(rank[Record.Moderna-1] , "Moderna");
+                write(file_fd,&Record,sizeof(Record));
+                sprintf(requestP[conn_fd].buf,"Preference order for %d modified successed, new preference order is %s > %s > %s.\n",Record.id,rank[0],rank[1],rank[2]);
+                write(requestP[conn_fd].conn_fd,requestP[conn_fd].buf,strlen(requestP[conn_fd].buf));
+                lock.l_type= F_UNLCK;
+                lock.l_start=sizeof(registerRecord)*(Record.id-902001);
+                lock.l_whence = SEEK_SET;
+                lock.l_len = sizeof(registerRecord);
+                fcntl(file_fd,F_SETLK, &lock);
+                fprintf(stderr,"finish writting");
+                writeLock[requestP[conn_fd].id-902001] = false;
+            }
+            else{
+                sprintf(requestP[conn_fd].buf,"Locked.\n");
+                write(requestP[conn_fd].conn_fd,requestP[conn_fd].buf,strlen(requestP[conn_fd].buf));
+                close(requestP[conn_fd].conn_fd);
+                free_request(&requestP[conn_fd]);
+            }
+        }
+        /***
+        fprintf(stderr, "%s", requestP[conn_fd].buf);
+        sprintf(buf,"%s : %s",accept_read_header,requestP[conn_fd].buf);
+        write(requestP[conn_fd].conn_fd, buf, strlen(buf));   
+        ***/     
+#endif
         close(requestP[conn_fd].conn_fd);
         free_request(&requestP[conn_fd]);
     }
@@ -146,6 +313,7 @@ static void init_request(request* reqP) {
     reqP->conn_fd = -1;
     reqP->buf_len = 0;
     reqP->id = 0;
+    reqP->wait_for_write = 0;//0 is not ready for write
 }
 
 static void free_request(request* reqP) {
